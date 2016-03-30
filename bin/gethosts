@@ -1,0 +1,54 @@
+#!/bin/bash
+
+quit() {
+    echo "Interrupted."
+    exit 255
+}
+
+trap "quit" SIGTERM
+trap "quit" SIGINT
+
+stage="production"
+
+while getopts ":hs:" opt; do
+  case $opt in
+    s)
+        stage=$OPTARG
+        ;;
+    h)
+        echo "usage: $(basename $0) [-s stage]"
+        exit 1
+        ;;
+    \?)
+        echo "Invalid option: -$OPTARG" >&2
+        ;;
+  esac
+done
+
+echo "Stage: $stage"
+
+shift $((OPTIND-1))
+host=$1
+
+line=$(aws route53 list-hosted-zones --query 'HostedZones[?contains(Name,`'$stage'`)].Id' --output text --region us-west-2)
+
+set -- $line
+
+while [ ! -z "$1" ]; do
+    aws route53 list-resource-record-sets --hosted-zone-id $1 --query 'ResourceRecordSets[?Type == `A`].[Name,AliasTarget.DNSName,AliasTarget.HostedZoneId]|[?contains([0],`'$host'`)]' --region us-west-2 --output text
+    shift
+done|
+while read name target hid; do
+    target=$(echo $target|awk '{gsub(/\.$/,"");print}')
+#    echo $name $target $hid $elb
+    aws elb describe-load-balancers --query 'LoadBalancerDescriptions[?CanonicalHostedZoneNameID==`'$hid'`].[LoadBalancerName,DNSName]' --region us-west-2 --output text|
+    awk -v name="$target" 'name == tolower($2) {print}'
+done|
+while read elb name; do
+    aws elb describe-load-balancers --query 'LoadBalancerDescriptions[?LoadBalancerName==`'$elb'`].Instances' --region us-west-2 --output text
+done|
+sort -u|
+while read instance; do
+    aws ec2 describe-instances --query 'Reservations[*].Instances|[]|[?InstanceId==`'$instance'`].{Name:Tags[?Key==`Name`].Value|[0],IP:PrivateIpAddress}|[0]' --region us-west-2 --output text
+trap "quit" SIGINT
+done
